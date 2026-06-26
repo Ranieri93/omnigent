@@ -220,6 +220,33 @@ def load_databricks_org_id(server_url: str) -> str | None:
     return org_id if isinstance(org_id, str) and org_id else None
 
 
+# Databricks "single pane of glass" workspace-routing header. On a SPOG
+# (unified-account / custom-domain) host the bare hostname is the account,
+# so the API proxy needs the workspace id to route a workspace API request;
+# it honors this header (equivalently to the ``?o=`` query param). See the
+# SPOG Traffic Routing design doc.
+DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
+
+
+def databricks_org_id_headers(server_url: str) -> dict[str, str]:
+    """Return the SPOG workspace-routing header for *server_url*, or ``{}``.
+
+    ``omnigent login https://<host>/?o=<id>`` records the ``?o=`` workspace
+    selector; this surfaces it as the :data:`DATABRICKS_ORG_ID_HEADER` so
+    every request and WebSocket handshake to a SPOG workspace routes to the
+    workspace instead of defaulting to the account API proxy. It is empty
+    for single-workspace hosts (no selector recorded), so non-SPOG callers
+    are unaffected.
+
+    :param server_url: The server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``{"X-Databricks-Org-Id": "<id>"}`` when a selector is
+        recorded for *server_url*, otherwise ``{}``.
+    """
+    org_id = load_databricks_org_id(server_url)
+    return {DATABRICKS_ORG_ID_HEADER: org_id} if org_id else {}
+
+
 def clear_token(server_url: str) -> None:
     """Remove a stored token for a server.
 

@@ -2395,7 +2395,11 @@ def _ensure_databricks_server_auth(server: str) -> None:
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {server} — running `{login_cmd}` first.")
-    _databricks_login(server, workspace_host)
+    # Recover the SPOG workspace selector from a prior login record so a
+    # re-login on a unified-account host still targets the right workspace.
+    from omnigent.cli_auth import load_databricks_org_id
+
+    _databricks_login(server, workspace_host, org_id=load_databricks_org_id(server))
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -5956,7 +5960,11 @@ def _dispatch_run(
 
     if target is None:
         if server_from_cli and server is not None and harness is None:
-            base_url = server.rstrip("/")
+            # Normalize like every other entry point: expand a bare Databricks
+            # workspace URL to its /api/2.0/omnigent mount and strip any SPOG
+            # ?o= query. Without this a direct ``--server`` request hits the
+            # workspace root and gets bounced to /login.
+            base_url = _resolve_server_url(server)
             # Direct ``--server`` (no AGENT) has no local runner to bind, so an
             # interactive resume-by-id is an ATTACH: route it through the
             # `attach` pair (`_require_live_conversation` + `run_attach`), not
@@ -11701,6 +11709,16 @@ def _workspace_api_server_url(server: str) -> str:
 
     server = server.rstrip("/")
     parsed = urlsplit(server)
+    # A SPOG ?o=<workspace-id> selector (or any query/fragment) on the input
+    # must not reach the probe or the returned base: every request appends a
+    # path (``f"{base}/v1/..."``), which would push that path into the query of
+    # a query-bearing base (``…/?o=123/v1/me``) — corrupting the probe and
+    # defeating the bare-host → /api/2.0/omnigent expansion. Strip it here; the
+    # selector is carried separately (persisted at login, replayed as the
+    # X-Databricks-Org-Id header), never on the base URL.
+    if parsed.query or parsed.fragment:
+        server = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
+        parsed = urlsplit(server)
     # The internal user guide hands out the workspace web-UI URL
     # (``https://<ws>/omnigent``) for browser access; accept it for login
     # too by expanding its bare root to the API mount. A root that does
@@ -11838,7 +11856,55 @@ def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> st
     return None
 
 
-def _databricks_login(server: str, workspace_host: str) -> None:
+def _org_id_from_url(url: str) -> str | None:
+    """Extract the ``?o=<workspace-id>`` SPOG workspace selector from *url*.
+
+    Databricks "single pane of glass" (unified account / custom-URL)
+    hosts serve every workspace in an account under one hostname and
+    select the target workspace with an ``?o=<workspace-id>`` query
+    param, e.g.
+    ``https://acme.cloud.databricks.com/?o=2177120769634929``. The bare
+    host resolves to the account, not a workspace, so the selector is
+    the only signal that names the workspace. It must be threaded into
+    both the workspace login (so the minted OAuth grant is bound to the
+    workspace) and every workspace API request (so the API proxy routes
+    to the workspace instead of the account).
+
+    :param url: A user-supplied server URL, possibly carrying ``?o=``,
+        e.g. ``"https://acme.databricks.com/?o=123"``.
+    :returns: The workspace id, e.g. ``"123"``, or ``None`` when absent.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    values = parse_qs(urlsplit(url).query).get("o")
+    return values[0] if values and values[0] else None
+
+
+def _host_with_org(workspace_host: str, org_id: str | None) -> str:
+    """Append the SPOG ``?o=<org>`` workspace selector to *workspace_host*.
+
+    ``databricks auth login --host https://<ws>/?o=<org>`` makes the
+    Databricks CLI record ``workspace_id = <org>`` in the
+    ``~/.databrickscfg`` profile, which binds the minted OAuth grant to
+    that workspace. Without the selector a unified-account host mints an
+    account-scoped grant that the workspace API proxy rejects (HTTP
+    403). Returns *workspace_host* unchanged when no org id is known, so
+    single-workspace hosts (where the host alone identifies the
+    workspace) are untouched.
+
+    :param workspace_host: The workspace host, e.g.
+        ``"https://example.databricks.com"``.
+    :param org_id: The workspace id from :func:`_org_id_from_url`, or
+        ``None``.
+    :returns: ``"https://<ws>/?o=<org>"`` when *org_id* is set, else
+        *workspace_host*.
+    """
+    if not org_id:
+        return workspace_host
+    return f"{workspace_host.rstrip('/')}/?o={org_id}"
+
+
+def _databricks_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
     """Log in to a Databricks-fronted Omnigent server.
 
     Covers both Databricks Apps deployments and workspace-hosted
@@ -11857,6 +11923,11 @@ def _databricks_login(server: str, workspace_host: str) -> None:
         ``"https://myapp-123.aws.databricksapps.com"``.
     :param workspace_host: The Databricks workspace to authenticate
         against, e.g. ``"https://example.databricks.com"``.
+    :param org_id: The SPOG workspace selector from the login URL's
+        ``?o=`` param (see :func:`_org_id_from_url`). When set, the
+        workspace login binds the grant to this workspace and the
+        verify request routes to it — required on unified-account
+        (single-pane-of-glass) hosts where the bare host is the account.
     :raises click.ClickException: When the ``databricks`` extra or CLI
         binary is missing, the workspace login fails, or the server
         rejects the workspace token.
@@ -11879,13 +11950,13 @@ def _databricks_login(server: str, workspace_host: str) -> None:
     token = _databricks_workspace_token(workspace_host)
     fresh_login_done = False
     if token is None:
-        token = _login_and_mint_workspace_token(workspace_host)
+        token = _login_and_mint_workspace_token(workspace_host, org_id)
         fresh_login_done = True
 
     # Verify the workspace token actually gets through the edge to THIS
     # server (the user may lack access to it), and learn our identity
     # for the success message.
-    verify = _verify_databricks_server_token(server, token)
+    verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200 and not fresh_login_done:
         # A cached grant can be stale or minted for a different
         # workspace (the CLI token cache is host-keyed but not
@@ -11895,8 +11966,8 @@ def _databricks_login(server: str, workspace_host: str) -> None:
             f"The cached Databricks credentials were rejected by {server} "
             f"(HTTP {verify.status_code}) — refreshing the workspace login."
         )
-        token = _login_and_mint_workspace_token(workspace_host)
-        verify = _verify_databricks_server_token(server, token)
+        token = _login_and_mint_workspace_token(workspace_host, org_id)
+        verify = _verify_databricks_server_token(server, token, org_id)
     if verify.status_code != 200:
         raise click.ClickException(
             f"{workspace_host} accepted the login, but {server} rejected the token "
@@ -11913,9 +11984,12 @@ def _databricks_login(server: str, workspace_host: str) -> None:
         server,
         workspace_host,
         user_id=user_id,
-        # Workspace responses carry the org id; recorded so browser
-        # links can append the ``?o=<org>`` workspace selector.
-        org_id=verify.headers.get("x-databricks-org-id"),
+        # The org id selects the workspace on unified-account hosts:
+        # later commands replay it as ``?o=`` to route API requests, and
+        # browser links append it as the ``?o=`` workspace selector. The
+        # login URL's selector is authoritative; fall back to the org id
+        # the workspace stamps on responses.
+        org_id=org_id or verify.headers.get("x-databricks-org-id"),
     )
     who = f" as {user_id}" if user_id else ""
     click.echo(
@@ -11923,17 +11997,20 @@ def _databricks_login(server: str, workspace_host: str) -> None:
     )
 
 
-def _login_and_mint_workspace_token(workspace_host: str) -> str:
+def _login_and_mint_workspace_token(workspace_host: str, org_id: str | None = None) -> str:
     """Run the browser login for a workspace and mint a bearer from it.
 
     :param workspace_host: The workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param org_id: The SPOG workspace selector (see
+        :func:`_org_id_from_url`); passed to the browser login so the
+        minted grant is bound to the workspace.
     :returns: A fresh bearer token for the workspace.
     :raises click.ClickException: When the Databricks CLI binary is
         missing, the login exits non-zero, or no token resolves after
         a successful login.
     """
-    _run_databricks_browser_login(workspace_host)
+    _run_databricks_browser_login(workspace_host, org_id)
     token = _databricks_workspace_token(workspace_host)
     if token is None:
         raise click.ClickException(
@@ -11943,11 +12020,17 @@ def _login_and_mint_workspace_token(workspace_host: str) -> str:
     return token
 
 
-def _run_databricks_browser_login(workspace_host: str) -> None:
+def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None) -> None:
     """Run ``databricks auth login --host <workspace>`` (browser flow).
 
     :param workspace_host: The workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param org_id: The SPOG workspace selector (see
+        :func:`_org_id_from_url`). When set, ``?o=<org_id>`` is appended
+        to ``--host`` so the Databricks CLI records ``workspace_id`` in
+        the profile and binds the grant to that workspace; on a
+        unified-account host the bare host would otherwise mint an
+        account-scoped grant the workspace rejects.
     :raises click.ClickException: When the Databricks CLI binary is
         missing or the login exits non-zero.
     """
@@ -11957,25 +12040,33 @@ def _run_databricks_browser_login(workspace_host: str) -> None:
             "The Databricks CLI is required to log in to a workspace. "
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
-    click.echo(f"Opening browser to log in to {workspace_host} ...")
+    login_host = _host_with_org(workspace_host, org_id)
+    click.echo(f"Opening browser to log in to {login_host} ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", workspace_host],
+        [databricks_bin, "auth", "login", "--host", login_host],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {workspace_host}` failed "
+            f"`databricks auth login --host {login_host}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
 
 
-def _verify_databricks_server_token(server: str, token: str) -> httpx.Response:
+def _verify_databricks_server_token(
+    server: str, token: str, org_id: str | None = None
+) -> httpx.Response:
     """Probe ``GET /v1/me`` on *server* with a workspace bearer.
 
     :param server: The server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
     :param token: The workspace bearer token to present.
+    :param org_id: The SPOG workspace selector (see
+        :func:`_org_id_from_url`). When set, the probe carries
+        ``?o=<org_id>`` so a unified-account API proxy routes it to the
+        workspace rather than defaulting to the account (which answers
+        HTTP 503 for a workspace path).
     :returns: The probe response (200 means the token is accepted and
         the body carries ``user_id``).
     :raises click.ClickException: When the server is unreachable.
@@ -11986,6 +12077,7 @@ def _verify_databricks_server_token(server: str, token: str) -> httpx.Response:
         return _httpx.get(
             f"{server}/v1/me",
             headers={"Authorization": f"Bearer {token}"},
+            params={"o": org_id} if org_id else None,
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
@@ -12081,6 +12173,10 @@ def login(server_url: str) -> None:
     import httpx as _httpx
 
     server = _resolve_server_url(server_url)
+    # The SPOG ``?o=<workspace-id>`` selector is read from the raw input
+    # because normalization strips the query when expanding to the API
+    # mount; it names the workspace on a unified-account host.
+    org_id = _org_id_from_url(server_url)
 
     # ── Step 0: Probe the server's auth mode. ──────────────────
     # /v1/me returns a JSON ``login_url`` on 401 — "/login" for
@@ -12098,7 +12194,7 @@ def login(server_url: str) -> None:
 
     databricks_workspace = _databricks_workspace_login_target(server, probe)
     if databricks_workspace is not None:
-        _databricks_login(server, databricks_workspace)
+        _databricks_login(server, databricks_workspace, org_id=org_id)
         _remember_default_server(server)
         return
 

@@ -2713,6 +2713,13 @@ async def _auto_create_kimi_terminal(
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
     _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # SPOG workspace routing: the hook subprocess replays these STATIC headers
+    # from its config (it has no refresh-capable httpx.Auth of its own), so the
+    # org selector must be baked in here or its POSTs misroute on a
+    # unified-account workspace.
+    from omnigent.cli_auth import databricks_org_id_headers
+
+    _runner_headers.update(databricks_org_id_headers(server_url))
     write_hook_config(
         bridge_dir,
         server_url=server_url,
@@ -3073,6 +3080,13 @@ async def _auto_create_codex_terminal(
     policy_headers = (
         {"Authorization": f"Bearer {_policy_auth_token}"} if _policy_auth_token else {}
     )
+    # SPOG workspace routing: the codex policy hook subprocess replays these
+    # static headers from its config (no refresh-capable auth of its own), so
+    # bake the org selector in or its /policies/evaluate POSTs misroute on a
+    # unified-account workspace.
+    from omnigent.cli_auth import databricks_org_id_headers
+
+    policy_headers.update(databricks_org_id_headers(launch_config.policy_server_url))
 
     app_server = build_codex_native_server(
         socket_path=socket_path,
@@ -4780,6 +4794,11 @@ async def _auto_create_claude_terminal(
     # with a ``None`` factory is a safe no-op (local unauthenticated).
     _auth_token = _auth_factory() if _auth_factory is not None else None
     _runner_headers = {"Authorization": f"Bearer {_auth_token}"} if _auth_token else {}
+    # SPOG workspace routing for the hook subprocess, which replays these
+    # static headers from its config (no refresh-capable auth of its own).
+    from omnigent.cli_auth import databricks_org_id_headers
+
+    _runner_headers.update(databricks_org_id_headers(server_url))
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.claude_native import (

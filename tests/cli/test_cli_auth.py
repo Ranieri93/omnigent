@@ -228,6 +228,32 @@ def test_store_and_load_databricks_record(token_dir) -> None:
     )
 
 
+def test_databricks_org_id_headers_from_record(token_dir) -> None:
+    """A recorded ?o= selector surfaces as the SPOG workspace-routing header.
+
+    On a unified-account (SPOG) host the API proxy needs the workspace id to
+    route a workspace request; this header carries it (the proxy honors it
+    equivalently to ``?o=``). A record with no org id (single-workspace host)
+    yields no header, so non-SPOG callers are unaffected.
+    """
+    from omnigent.cli_auth import databricks_org_id_headers, store_databricks_auth
+
+    store_databricks_auth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent",
+        workspace_host="https://acme.databricks.com",
+        org_id="2850744067564480",
+    )
+    assert databricks_org_id_headers("https://acme.databricks.com/api/2.0/omnigent") == {
+        "X-Databricks-Org-Id": "2850744067564480"
+    }
+
+    store_databricks_auth(
+        server_url="https://single.databricks.com/api/2.0/omnigent",
+        workspace_host="https://single.databricks.com",
+    )
+    assert databricks_org_id_headers("https://single.databricks.com/api/2.0/omnigent") == {}
+
+
 def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
     """A Databricks pointer record carries NO bearer — load_token must miss.
 

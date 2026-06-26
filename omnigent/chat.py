@@ -620,23 +620,38 @@ def _remote_headers(
         stored OIDC tokens, e.g. ``"http://localhost:6767"``.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
+    # Resolve the bearer in the documented precedence order (one credential
+    # source per branch), then merge the SPOG workspace-routing header.
+    headers: dict[str, str] = {}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
-        return {"Authorization": f"Bearer {token}"}
-    # Check stored OIDC token from `omnigent login`.
-    if server_url:
+        # 1. Explicit env-var token.
+        headers["Authorization"] = f"Bearer {token}"
+    elif server_url:
         from omnigent.cli_auth import load_token
 
+        # 2. Stored OIDC session token from `omnigent login`.
         oidc_token = load_token(server_url)
         if oidc_token:
-            return {"Authorization": f"Bearer {oidc_token}"}
-        record_token = _stored_databricks_record_token(server_url)
-        if record_token:
-            return {"Authorization": f"Bearer {record_token}"}
-    creds = _read_databrickscfg(None)
-    if creds is None or not creds.token:
-        return {}
-    return {"Authorization": f"Bearer {creds.token}"}
+            headers["Authorization"] = f"Bearer {oidc_token}"
+        else:
+            # 3. Databricks Apps pointer record → mint a fresh workspace token.
+            record_token = _stored_databricks_record_token(server_url)
+            if record_token:
+                headers["Authorization"] = f"Bearer {record_token}"
+    if "Authorization" not in headers:
+        # 4. Ambient ~/.databrickscfg credentials.
+        creds = _read_databrickscfg(None)
+        if creds is not None and creds.token:
+            headers["Authorization"] = f"Bearer {creds.token}"
+    # SPOG workspace routing: when `omnigent login` recorded an ?o= selector,
+    # name the workspace or the proxy routes to the account API proxy. Merged
+    # onto the result because these ad-hoc requests carry no httpx Auth.
+    if server_url:
+        from omnigent.cli_auth import databricks_org_id_headers
+
+        headers.update(databricks_org_id_headers(server_url))
+    return headers
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -748,9 +763,21 @@ class _DatabricksTokenAuth(httpx.Auth):
         then the reused Databricks SDK auth (which refreshes expired
         OAuth tokens transparently).
 
+        On a unified-account (single-pane-of-glass) host the bare host is
+        the account, so the stored ``X-Databricks-Org-Id`` selector is set
+        first — without it the API proxy routes the request to the account
+        instead of the workspace. Applied regardless of which credential
+        branch below sets the bearer.
+
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        # SPOG workspace routing (empty for non-SPOG); set regardless of which
+        # credential branch below sets the bearer.
+        if self._server_url:
+            from omnigent.cli_auth import databricks_org_id_headers
+
+            request.headers.update(databricks_org_id_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
             yield request

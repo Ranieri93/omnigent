@@ -295,6 +295,7 @@ async def serve_tunnel(
             await _serve_tunnel_once(
                 app,
                 tunnel_url=tunnel_url,
+                server_url=server_url,
                 runner_id=runner_id,
                 runner_version=runner_version,
                 auth_token=auth_token,
@@ -494,6 +495,7 @@ async def _serve_tunnel_once(
     app: _ASGIApp,
     *,
     tunnel_url: str,
+    server_url: str,
     runner_id: str,
     runner_version: str,
     auth_token: str | None = None,
@@ -505,6 +507,10 @@ async def _serve_tunnel_once(
     :param app: Runner ASGI application.
     :param tunnel_url: WebSocket URL to connect to, e.g.
         ``"ws://127.0.0.1:6767/v1/runners/runner_abc/tunnel"``.
+    :param server_url: HTTP(S) server base URL the tunnel belongs to,
+        e.g. ``"https://example.databricks.com/api/2.0/omnigent"``. Used
+        to look up the SPOG workspace-routing header (keyed by server URL,
+        not the ws tunnel URL).
     :param runner_id: Stable runner id, e.g. ``"runner_abc"``.
     :param runner_version: Runner version string for the hello
         frame, e.g. ``"0.1.0"``.
@@ -526,6 +532,12 @@ async def _serve_tunnel_once(
     # browser and would otherwise rely on the permissive missing-origin
     # branch.
     headers: dict[str, str] = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    # SPOG workspace routing: on a unified-account host the handshake must
+    # name the workspace or the proxy routes it to the account
+    # (shard-not-found). Empty for single-workspace hosts (no recorded ?o=).
+    from omnigent.cli_auth import databricks_org_id_headers
+
+    headers.update(databricks_org_id_headers(server_url))
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
     if tunnel_token:
